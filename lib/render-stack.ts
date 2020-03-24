@@ -1,21 +1,22 @@
 import * as cdk from "@aws-cdk/core";
 import * as ec2 from "@aws-cdk/aws-ec2";
 import * as s3 from "@aws-cdk/aws-s3";
-import * as cloudtrail from "@aws-cdk/aws-cloudtrail";
 import * as lambda from "@aws-cdk/aws-lambda";
 import * as iam from "@aws-cdk/aws-iam";
 import * as sqs from "@aws-cdk/aws-sqs";
 import * as cloudfront from "@aws-cdk/aws-cloudfront";
-import * as apigateway from "@aws-cdk/aws-apigateway";
 import * as autoscaling from "@aws-cdk/aws-autoscaling";
 import * as cloudwatch from "@aws-cdk/aws-cloudwatch";
 import * as events from "@aws-cdk/aws-events";
 import * as targets from "@aws-cdk/aws-events-targets";
 import * as sources from "@aws-cdk/aws-lambda-event-sources";
+import * as sns from "@aws-cdk/aws-sns";
+import * as subs from "@aws-cdk/aws-sns-subscriptions";
 
 interface RenderStackProps extends cdk.StackProps {
   vpc: ec2.Vpc;
   projectName: string;
+  operatorEmail: string;
 }
 
 export class RenderStack extends cdk.Stack {
@@ -27,6 +28,7 @@ export class RenderStack extends cdk.Stack {
   public readonly jobFunctionRole: iam.Role;
   public readonly jobDlq: sqs.Queue;
   public readonly jobASG: autoscaling.AutoScalingGroup;
+  public readonly jobASGSnsTopic: sns.Topic;
   public readonly jobASGTargetTrackingPolicy: autoscaling.TargetTrackingScalingPolicy;
   public readonly jobASGScaleFunction: lambda.Function;
   public readonly jobASGScaleFunctionRole: iam.Role;
@@ -93,6 +95,14 @@ export class RenderStack extends cdk.Stack {
       queueName: `${props.projectName}-dlq`
     });
 
+    // Sns topic ...
+    this.jobASGSnsTopic = new sns.Topic(this, "jobAsgTopic", {
+      topicName: `${props.projectName}-job-asg`
+    });
+    this.jobASGSnsTopic.addSubscription(
+      new subs.EmailSubscription(props.operatorEmail)
+    );
+
     // S3 events ...
     this.jobFunctionRole = new iam.Role(this, "jobFunctionRole", {
       roleName: `${props.projectName}-JobFunctionRole`,
@@ -151,6 +161,7 @@ export class RenderStack extends cdk.Stack {
         ec2.InstanceClass.P2,
         ec2.InstanceSize.XLARGE
       ),
+      notificationsTopic: this.jobASGSnsTopic,
       machineImage: new ec2.AmazonLinuxImage()
     });
 
@@ -165,6 +176,103 @@ export class RenderStack extends cdk.Stack {
         unit: cloudwatch.Unit.NONE
       }),
       targetValue: 100
+    });
+
+    const lc = this.jobASG.node.findChild(
+      "LaunchConfig"
+    ) as autoscaling.CfnLaunchConfiguration;
+    lc.addOverride("Metadata", {
+      Comment: "Install a simple application",
+      "AWS::CloudFormation::Init": {
+        config: {
+          packages: {
+            yum: {
+              httpd: [],
+              freetype: [],
+              "freetype-devel": [],
+              "libpng-devel": [],
+              "mesa-libGLU-devel": [],
+              "libX11-devel": [],
+              "mesa-libGL-devel": [],
+              "perl-Time-HiRes": [],
+              libXi: [],
+              libXrender: []
+            }
+          },
+          commands: {
+            test: {
+              command:
+                "curl -L https://ftp.halifax.rwth-aachen.de/blender/release/Blender2.82/blender-2.82a-linux64.tar.xz -o blender-2.82a-linux64.tar.xz && tar xf blender-2.82a-linux64.tar.xz",
+              env: {},
+              cwd: "~"
+            }
+          },
+          files: {
+            "/etc/cfn/cfn-hup.conf": {
+              content: `[main]
+stack=${this.stackId}
+region=${this.region}`,
+              mode: "000400",
+              owner: "root",
+              group: "root"
+            },
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf": {
+              content: `[cfn-auto-reloader-hook]
+triggers=post.update
+path=Resources.LaunchConfig.Metadata.AWS::CloudFormation::Init
+action=/opt/aws/bin/cfn-init -v stack ${this.stackId} --resource LaunchConfig --region ${this.region}
+runas=root
+`
+            },
+            "/home/ec2-user/config.py": {
+              content: `import bpy
+
+bpy.context.scene.cycles.device = 'GPU'
+
+for scene in bpy.data.scenes:
+    print(scene.name)
+    scene.cycles.device = 'GPU'
+    scene.render.resolution_percentage = 200
+    scene.cycles.samples = 128
+bpy.context.preferences.addons['cycles'].preferences.compute_device_type = 'CUDA'
+for devices in bpy.context.preferences.addons['cycles'].preferences.get_devices():
+    for d in devices:
+        d.use = True
+
+for scene in bpy.data.scenes:
+    scene.render.filepath = "/tmp/{}.png" . format(scene.name)
+    bpy.ops.render.render(scene=scene.name, write_still=True)
+`,
+              mode: "0744",
+              owner: "root",
+              group: "root"
+            },
+            "/home/ec2-user/render.sh": {
+              content: `#!/bin/bash
+BLEND="/tmp/demo.blend"
+
+/home/ec2-user/blender-2.82a-linux64/blender --enable-autoexec -noaudio --background "$BLEND" --P "config.py"
+`,
+              mode: "0744",
+              owner: "root",
+              group: "root"
+            }
+          },
+          services: {
+            sysvinit: {
+              httpd: { enabled: "true", ensureRunning: "true" },
+              "cfn-hup": {
+                enabled: "true",
+                ensureRunning: "true",
+                files: [
+                  "/etc/cfn/cfn-hup.conf",
+                  "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
+                ]
+              }
+            }
+          }
+        }
+      }
     });
 
     this.jobASGScaleFunctionRole = new iam.Role(this, "jobASGFunctionRole", {
@@ -213,8 +321,7 @@ export class RenderStack extends cdk.Stack {
         JOB_QUEUE_URL: `${this.jobQueue.queueUrl}`,
         ASG_NAME: `${this.jobASG.autoScalingGroupName}`,
         METRIC_NAMESPACE: "Custom",
-        METRIC_NAME: `${props.projectName}-job-target`,
-        PROC_TIME_SEC: "1"
+        METRIC_NAME: `${props.projectName}-job-target`
       }
     });
 
