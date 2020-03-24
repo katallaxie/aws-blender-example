@@ -148,8 +148,8 @@ export class RenderStack extends cdk.Stack {
       minCapacity: 1,
       maxCapacity: 10,
       instanceType: ec2.InstanceType.of(
-        ec2.InstanceClass.BURSTABLE2,
-        ec2.InstanceSize.MICRO
+        ec2.InstanceClass.P2,
+        ec2.InstanceSize.XLARGE
       ),
       machineImage: new ec2.AmazonLinuxImage()
     });
